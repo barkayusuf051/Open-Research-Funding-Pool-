@@ -9,11 +9,17 @@
 (define-constant ERR_PROPOSAL_NOT_APPROVED (err u410))
 (define-constant ERR_INVALID_MILESTONE (err u411))
 (define-constant ERR_ALREADY_VOTED (err u412))
+(define-constant ERR_DISPUTE_NOT_FOUND (err u413))
+(define-constant ERR_DISPUTE_ALREADY_EXISTS (err u414))
+(define-constant ERR_DISPUTE_VOTING_ENDED (err u415))
+(define-constant ERR_MILESTONE_NOT_DISPUTED (err u416))
 
 (define-data-var next-proposal-id uint u1)
 (define-data-var treasury-balance uint u0)
 (define-data-var voting-period uint u1000)
 (define-data-var min-quorum uint u10)
+(define-data-var dispute-voting-period uint u500)
+(define-data-var next-dispute-id uint u1)
 
 (define-map proposals
   uint
@@ -48,6 +54,26 @@
 )
 
 (define-map voter-weights principal uint)
+
+(define-map milestone-disputes
+  uint
+  {
+    proposal-id: uint,
+    milestone-id: uint,
+    challenger: principal,
+    reason: (string-ascii 300),
+    votes-uphold: uint,
+    votes-overturn: uint,
+    voting-ends: uint,
+    status: (string-ascii 20),
+    created-at: uint
+  }
+)
+
+(define-map dispute-votes
+  { dispute-id: uint, voter: principal }
+  { vote: bool, amount: uint }
+)
 
 (define-public (deposit-funds (amount uint))
   (begin
@@ -305,4 +331,130 @@
 
 (define-read-only (get-min-quorum)
   (var-get min-quorum)
+)
+
+(define-public (create-milestone-dispute 
+  (proposal-id uint) 
+  (milestone-id uint) 
+  (reason (string-ascii 300))
+)
+  (let
+    (
+      (proposal (unwrap! (map-get? proposals proposal-id) ERR_PROPOSAL_NOT_FOUND))
+      (milestone (unwrap! (map-get? proposal-milestones { proposal-id: proposal-id, milestone-id: milestone-id }) ERR_MILESTONE_NOT_FOUND))
+      (dispute-id (var-get next-dispute-id))
+      (current-height stacks-block-height)
+      (voter-weight (default-to u1 (map-get? voter-weights tx-sender)))
+    )
+    (asserts! (get completed milestone) ERR_INVALID_MILESTONE)
+    (asserts! (not (get paid milestone)) ERR_MILESTONE_ALREADY_PAID)
+    (asserts! (>= voter-weight u1) ERR_UNAUTHORIZED)
+    (asserts! (not (is-eq tx-sender (get researcher proposal))) ERR_UNAUTHORIZED)
+    
+    (map-set milestone-disputes dispute-id
+      {
+        proposal-id: proposal-id,
+        milestone-id: milestone-id,
+        challenger: tx-sender,
+        reason: reason,
+        votes-uphold: u0,
+        votes-overturn: u0,
+        voting-ends: (+ current-height (var-get dispute-voting-period)),
+        status: "voting",
+        created-at: current-height
+      }
+    )
+    (var-set next-dispute-id (+ dispute-id u1))
+    (ok dispute-id)
+  )
+)
+
+(define-public (vote-on-dispute (dispute-id uint) (uphold-completion bool))
+  (let
+    (
+      (dispute (unwrap! (map-get? milestone-disputes dispute-id) ERR_DISPUTE_NOT_FOUND))
+      (voter-weight (default-to u1 (map-get? voter-weights tx-sender)))
+      (current-height stacks-block-height)
+      (existing-vote (map-get? dispute-votes { dispute-id: dispute-id, voter: tx-sender }))
+    )
+    (asserts! (< current-height (get voting-ends dispute)) ERR_DISPUTE_VOTING_ENDED)
+    (asserts! (is-eq (get status dispute) "voting") ERR_DISPUTE_VOTING_ENDED)
+    (asserts! (is-none existing-vote) ERR_ALREADY_VOTED)
+    
+    (map-set dispute-votes { dispute-id: dispute-id, voter: tx-sender }
+      { vote: uphold-completion, amount: voter-weight }
+    )
+    (if uphold-completion
+      (map-set milestone-disputes dispute-id
+        (merge dispute { votes-uphold: (+ (get votes-uphold dispute) voter-weight) })
+      )
+      (map-set milestone-disputes dispute-id
+        (merge dispute { votes-overturn: (+ (get votes-overturn dispute) voter-weight) })
+      )
+    )
+    (ok true)
+  )
+)
+
+(define-public (resolve-milestone-dispute (dispute-id uint))
+  (let
+    (
+      (dispute (unwrap! (map-get? milestone-disputes dispute-id) ERR_DISPUTE_NOT_FOUND))
+      (current-height stacks-block-height)
+      (total-votes (+ (get votes-uphold dispute) (get votes-overturn dispute)))
+      (proposal-id (get proposal-id dispute))
+      (milestone-id (get milestone-id dispute))
+      (milestone (unwrap! (map-get? proposal-milestones { proposal-id: proposal-id, milestone-id: milestone-id }) ERR_MILESTONE_NOT_FOUND))
+    )
+    (asserts! (>= current-height (get voting-ends dispute)) ERR_VOTING_NOT_ENDED)
+    (asserts! (is-eq (get status dispute) "voting") ERR_DISPUTE_VOTING_ENDED)
+    (asserts! (>= total-votes (var-get min-quorum)) ERR_INSUFFICIENT_FUNDS)
+    
+    (if (> (get votes-uphold dispute) (get votes-overturn dispute))
+      (begin
+        (map-set milestone-disputes dispute-id
+          (merge dispute { status: "upheld" })
+        )
+        (ok "milestone-upheld")
+      )
+      (begin
+        (map-set milestone-disputes dispute-id
+          (merge dispute { status: "overturned" })
+        )
+        (map-set proposal-milestones 
+          { proposal-id: proposal-id, milestone-id: milestone-id }
+          (merge milestone { 
+            completed: false,
+            completed-at: u0
+          })
+        )
+        (ok "milestone-overturned")
+      )
+    )
+  )
+)
+
+(define-public (set-dispute-voting-period (new-period uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (> new-period u0) ERR_INVALID_MILESTONE)
+    (var-set dispute-voting-period new-period)
+    (ok new-period)
+  )
+)
+
+(define-read-only (get-milestone-dispute (dispute-id uint))
+  (map-get? milestone-disputes dispute-id)
+)
+
+(define-read-only (get-dispute-vote (dispute-id uint) (voter principal))
+  (map-get? dispute-votes { dispute-id: dispute-id, voter: voter })
+)
+
+(define-read-only (get-next-dispute-id)
+  (var-get next-dispute-id)
+)
+
+(define-read-only (get-dispute-voting-period)
+  (var-get dispute-voting-period)
 )
