@@ -13,6 +13,11 @@
 (define-constant ERR_DISPUTE_ALREADY_EXISTS (err u414))
 (define-constant ERR_DISPUTE_VOTING_ENDED (err u415))
 (define-constant ERR_MILESTONE_NOT_DISPUTED (err u416))
+(define-constant ERR_CATEGORY_NOT_FOUND (err u417))
+(define-constant ERR_CATEGORY_ALREADY_EXISTS (err u418))
+(define-constant ERR_INSUFFICIENT_CATEGORY_FUNDS (err u419))
+(define-constant ERR_EXCEEDS_CATEGORY_MAX_AMOUNT (err u420))
+(define-constant ERR_INVALID_CATEGORY_ALLOCATION (err u421))
 
 (define-data-var next-proposal-id uint u1)
 (define-data-var treasury-balance uint u0)
@@ -20,6 +25,21 @@
 (define-data-var min-quorum uint u10)
 (define-data-var dispute-voting-period uint u500)
 (define-data-var next-dispute-id uint u1)
+(define-data-var category-counter uint u1)
+(define-data-var total-category-allocations uint u0)
+(define-data-var default-category-id uint u1)
+
+(define-map research-categories
+  uint
+  {
+    name: (string-ascii 50),
+    allocated-funds: uint,
+    max-proposal-amount: uint,
+    min-quorum: uint,
+    active: bool,
+    created-at: uint
+  }
+)
 
 (define-map proposals
   uint
@@ -33,7 +53,8 @@
     votes-against: uint,
     voting-ends: uint,
     status: (string-ascii 20),
-    created-at: uint
+    created-at: uint,
+    category-id: uint
   }
 )
 
@@ -90,19 +111,101 @@
   )
 )
 
+(define-public (create-research-category 
+  (name (string-ascii 50))
+  (allocated-funds uint)
+  (max-proposal-amount uint)
+  (category-quorum uint)
+)
+  (let
+    (
+      (category-id (var-get category-counter))
+      (current-height stacks-block-height)
+    )
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (> allocated-funds u0) ERR_INVALID_CATEGORY_ALLOCATION)
+    (asserts! (> max-proposal-amount u0) ERR_INVALID_CATEGORY_ALLOCATION)
+    (asserts! (> category-quorum u0) ERR_INVALID_CATEGORY_ALLOCATION)
+    
+    (map-set research-categories category-id
+      {
+        name: name,
+        allocated-funds: allocated-funds,
+        max-proposal-amount: max-proposal-amount,
+        min-quorum: category-quorum,
+        active: true,
+        created-at: current-height
+      }
+    )
+    (var-set category-counter (+ category-id u1))
+    (var-set total-category-allocations (+ (var-get total-category-allocations) allocated-funds))
+    (ok category-id)
+  )
+)
+
+(define-public (allocate-category-funds (category-id uint) (amount uint))
+  (let
+    (
+      (category (unwrap! (map-get? research-categories category-id) ERR_CATEGORY_NOT_FOUND))
+    )
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (get active category) ERR_CATEGORY_NOT_FOUND)
+    (asserts! (> amount u0) ERR_INVALID_CATEGORY_ALLOCATION)
+    
+    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+    (map-set research-categories category-id
+      (merge category { 
+        allocated-funds: (+ (get allocated-funds category) amount)
+      })
+    )
+    (var-set total-category-allocations (+ (var-get total-category-allocations) amount))
+    (var-set treasury-balance (+ (var-get treasury-balance) amount))
+    (ok amount)
+  )
+)
+
+(define-public (update-category-allocation 
+  (category-id uint) 
+  (max-proposal-amount uint)
+  (category-quorum uint)
+)
+  (let
+    (
+      (category (unwrap! (map-get? research-categories category-id) ERR_CATEGORY_NOT_FOUND))
+    )
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (get active category) ERR_CATEGORY_NOT_FOUND)
+    (asserts! (> max-proposal-amount u0) ERR_INVALID_CATEGORY_ALLOCATION)
+    (asserts! (> category-quorum u0) ERR_INVALID_CATEGORY_ALLOCATION)
+    
+    (map-set research-categories category-id
+      (merge category { 
+        max-proposal-amount: max-proposal-amount,
+        min-quorum: category-quorum
+      })
+    )
+    (ok true)
+  )
+)
+
 (define-public (create-proposal 
   (title (string-ascii 100))
   (description (string-ascii 500))
   (funding-amount uint)
   (milestones uint)
+  (category-id uint)
 )
   (let
     (
       (proposal-id (var-get next-proposal-id))
       (current-height stacks-block-height)
+      (category (unwrap! (map-get? research-categories category-id) ERR_CATEGORY_NOT_FOUND))
     )
     (asserts! (> milestones u0) ERR_INVALID_MILESTONE)
     (asserts! (> funding-amount u0) ERR_INSUFFICIENT_FUNDS)
+    (asserts! (get active category) ERR_CATEGORY_NOT_FOUND)
+    (asserts! (<= funding-amount (get max-proposal-amount category)) ERR_EXCEEDS_CATEGORY_MAX_AMOUNT)
+    (asserts! (<= funding-amount (get allocated-funds category)) ERR_INSUFFICIENT_CATEGORY_FUNDS)
     
     (map-set proposals proposal-id
       {
@@ -115,7 +218,8 @@
         votes-against: u0,
         voting-ends: (+ current-height (var-get voting-period)),
         status: "voting",
-        created-at: current-height
+        created-at: current-height,
+        category-id: category-id
       }
     )
     (var-set next-proposal-id (+ proposal-id u1))
@@ -156,15 +260,22 @@
       (proposal (unwrap! (map-get? proposals proposal-id) ERR_PROPOSAL_NOT_FOUND))
       (current-height stacks-block-height)
       (total-votes (+ (get votes-for proposal) (get votes-against proposal)))
+      (category (unwrap! (map-get? research-categories (get category-id proposal)) ERR_CATEGORY_NOT_FOUND))
+      (required-quorum (get min-quorum category))
     )
     (asserts! (>= current-height (get voting-ends proposal)) ERR_VOTING_NOT_ENDED)
     (asserts! (is-eq (get status proposal) "voting") ERR_VOTING_ENDED)
-    (asserts! (>= total-votes (var-get min-quorum)) ERR_INSUFFICIENT_FUNDS)
+    (asserts! (>= total-votes required-quorum) ERR_INSUFFICIENT_FUNDS)
     
     (if (> (get votes-for proposal) (get votes-against proposal))
       (begin
         (map-set proposals proposal-id
           (merge proposal { status: "approved" })
+        )
+        (map-set research-categories (get category-id proposal)
+          (merge category {
+            allocated-funds: (- (get allocated-funds category) (get funding-amount proposal))
+          })
         )
         (ok "approved")
       )
@@ -457,4 +568,27 @@
 
 (define-read-only (get-dispute-voting-period)
   (var-get dispute-voting-period)
+)
+
+(define-read-only (get-category-info (category-id uint))
+  (map-get? research-categories category-id)
+)
+
+(define-read-only (get-category-available-funds (category-id uint))
+  (match (map-get? research-categories category-id)
+    category (ok (get allocated-funds category))
+    ERR_CATEGORY_NOT_FOUND
+  )
+)
+
+(define-read-only (get-category-counter)
+  (var-get category-counter)
+)
+
+(define-read-only (get-total-category-allocations)
+  (var-get total-category-allocations)
+)
+
+(define-read-only (get-default-category-id)
+  (var-get default-category-id)
 )
