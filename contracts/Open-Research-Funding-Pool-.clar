@@ -18,6 +18,11 @@
 (define-constant ERR_INSUFFICIENT_CATEGORY_FUNDS (err u419))
 (define-constant ERR_EXCEEDS_CATEGORY_MAX_AMOUNT (err u420))
 (define-constant ERR_INVALID_CATEGORY_ALLOCATION (err u421))
+(define-constant ERR_AMENDMENT_NOT_FOUND (err u422))
+(define-constant ERR_AMENDMENT_VOTING_ENDED (err u423))
+(define-constant ERR_AMENDMENT_ALREADY_APPLIED (err u424))
+(define-constant ERR_CANNOT_AMEND_PROPOSAL (err u425))
+(define-constant ERR_AMENDMENT_ALREADY_VOTED (err u426))
 
 (define-data-var next-proposal-id uint u1)
 (define-data-var treasury-balance uint u0)
@@ -28,6 +33,8 @@
 (define-data-var category-counter uint u1)
 (define-data-var total-category-allocations uint u0)
 (define-data-var default-category-id uint u1)
+(define-data-var next-amendment-id uint u1)
+(define-data-var amendment-voting-period uint u200)
 
 (define-map research-categories
   uint
@@ -93,6 +100,28 @@
 
 (define-map dispute-votes
   { dispute-id: uint, voter: principal }
+  { vote: bool, amount: uint }
+)
+
+(define-map proposal-amendments
+  uint
+  {
+    proposal-id: uint,
+    proposer: principal,
+    new-title: (optional (string-ascii 100)),
+    new-description: (optional (string-ascii 500)),
+    new-funding-amount: (optional uint),
+    new-milestones: (optional uint),
+    votes-for: uint,
+    votes-against: uint,
+    voting-ends: uint,
+    status: (string-ascii 20),
+    created-at: uint
+  }
+)
+
+(define-map amendment-votes
+  { amendment-id: uint, voter: principal }
   { vote: bool, amount: uint }
 )
 
@@ -591,4 +620,149 @@
 
 (define-read-only (get-default-category-id)
   (var-get default-category-id)
+)
+
+(define-public (propose-amendment
+  (proposal-id uint)
+  (new-title (optional (string-ascii 100)))
+  (new-description (optional (string-ascii 500)))
+  (new-funding-amount (optional uint))
+  (new-milestones (optional uint))
+)
+  (let
+    (
+      (proposal (unwrap! (map-get? proposals proposal-id) ERR_PROPOSAL_NOT_FOUND))
+      (amendment-id (var-get next-amendment-id))
+      (current-height stacks-block-height)
+      (category (unwrap! (map-get? research-categories (get category-id proposal)) ERR_CATEGORY_NOT_FOUND))
+    )
+    (asserts! (is-eq tx-sender (get researcher proposal)) ERR_UNAUTHORIZED)
+    (asserts! (is-eq (get status proposal) "voting") ERR_CANNOT_AMEND_PROPOSAL)
+    (asserts! (< current-height (get voting-ends proposal)) ERR_VOTING_ENDED)
+    (asserts! 
+      (or 
+        (is-some new-title) 
+        (is-some new-description) 
+        (is-some new-funding-amount) 
+        (is-some new-milestones)
+      ) 
+      ERR_INVALID_MILESTONE
+    )
+    (match new-funding-amount
+      amount (asserts! (<= amount (get max-proposal-amount category)) ERR_EXCEEDS_CATEGORY_MAX_AMOUNT)
+      true
+    )
+    
+    (map-set proposal-amendments amendment-id
+      {
+        proposal-id: proposal-id,
+        proposer: tx-sender,
+        new-title: new-title,
+        new-description: new-description,
+        new-funding-amount: new-funding-amount,
+        new-milestones: new-milestones,
+        votes-for: u0,
+        votes-against: u0,
+        voting-ends: (+ current-height (var-get amendment-voting-period)),
+        status: "voting",
+        created-at: current-height
+      }
+    )
+    (var-set next-amendment-id (+ amendment-id u1))
+    (ok amendment-id)
+  )
+)
+
+(define-public (vote-on-amendment (amendment-id uint) (support bool))
+  (let
+    (
+      (amendment (unwrap! (map-get? proposal-amendments amendment-id) ERR_AMENDMENT_NOT_FOUND))
+      (proposal (unwrap! (map-get? proposals (get proposal-id amendment)) ERR_PROPOSAL_NOT_FOUND))
+      (voter-weight (default-to u1 (map-get? voter-weights tx-sender)))
+      (current-height stacks-block-height)
+      (existing-vote (map-get? amendment-votes { amendment-id: amendment-id, voter: tx-sender }))
+    )
+    (asserts! (< current-height (get voting-ends amendment)) ERR_AMENDMENT_VOTING_ENDED)
+    (asserts! (is-eq (get status amendment) "voting") ERR_AMENDMENT_VOTING_ENDED)
+    (asserts! (is-none existing-vote) ERR_AMENDMENT_ALREADY_VOTED)
+    (asserts! (is-eq (get status proposal) "voting") ERR_CANNOT_AMEND_PROPOSAL)
+    
+    (map-set amendment-votes { amendment-id: amendment-id, voter: tx-sender }
+      { vote: support, amount: voter-weight }
+    )
+    (if support
+      (map-set proposal-amendments amendment-id
+        (merge amendment { votes-for: (+ (get votes-for amendment) voter-weight) })
+      )
+      (map-set proposal-amendments amendment-id
+        (merge amendment { votes-against: (+ (get votes-against amendment) voter-weight) })
+      )
+    )
+    (ok true)
+  )
+)
+
+(define-public (apply-amendment (amendment-id uint))
+  (let
+    (
+      (amendment (unwrap! (map-get? proposal-amendments amendment-id) ERR_AMENDMENT_NOT_FOUND))
+      (proposal-id (get proposal-id amendment))
+      (proposal (unwrap! (map-get? proposals proposal-id) ERR_PROPOSAL_NOT_FOUND))
+      (current-height stacks-block-height)
+      (total-votes (+ (get votes-for amendment) (get votes-against amendment)))
+      (category (unwrap! (map-get? research-categories (get category-id proposal)) ERR_CATEGORY_NOT_FOUND))
+    )
+    (asserts! (>= current-height (get voting-ends amendment)) ERR_VOTING_NOT_ENDED)
+    (asserts! (is-eq (get status amendment) "voting") ERR_AMENDMENT_ALREADY_APPLIED)
+    (asserts! (is-eq (get status proposal) "voting") ERR_CANNOT_AMEND_PROPOSAL)
+    (asserts! (>= total-votes (get min-quorum category)) ERR_INSUFFICIENT_FUNDS)
+    
+    (if (> (get votes-for amendment) (get votes-against amendment))
+      (begin
+        (map-set proposals proposal-id
+          (merge proposal {
+            title: (default-to (get title proposal) (get new-title amendment)),
+            description: (default-to (get description proposal) (get new-description amendment)),
+            funding-amount: (default-to (get funding-amount proposal) (get new-funding-amount amendment)),
+            milestones: (default-to (get milestones proposal) (get new-milestones amendment))
+          })
+        )
+        (map-set proposal-amendments amendment-id
+          (merge amendment { status: "applied" })
+        )
+        (ok "amendment-applied")
+      )
+      (begin
+        (map-set proposal-amendments amendment-id
+          (merge amendment { status: "rejected" })
+        )
+        (ok "amendment-rejected")
+      )
+    )
+  )
+)
+
+(define-public (set-amendment-voting-period (new-period uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (> new-period u0) ERR_INVALID_MILESTONE)
+    (var-set amendment-voting-period new-period)
+    (ok new-period)
+  )
+)
+
+(define-read-only (get-amendment (amendment-id uint))
+  (map-get? proposal-amendments amendment-id)
+)
+
+(define-read-only (get-amendment-vote (amendment-id uint) (voter principal))
+  (map-get? amendment-votes { amendment-id: amendment-id, voter: voter })
+)
+
+(define-read-only (get-next-amendment-id)
+  (var-get next-amendment-id)
+)
+
+(define-read-only (get-amendment-voting-period)
+  (var-get amendment-voting-period)
 )
